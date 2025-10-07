@@ -11,7 +11,9 @@ from src.tools.databricks_tools import (
     list_cluster_logs,
     analyze_cluster_logs,
     search_log_pattern,
-    get_job_execution_timeline
+    get_job_execution_timeline,
+    analyze_cluster_logs_smart,
+    quick_error_scan
 )
 
 AGENT_INSTRUCTIONS = """
@@ -21,10 +23,12 @@ stored in S3 to identify and resolve issues with Spark jobs and workflows.
 ## Your Capabilities:
 1. **Job Discovery**: Search for Databricks jobs by name patterns
 2. **Cluster ID Retrieval**: Find cluster IDs associated with specific jobs and time ranges
-3. **Log Analysis**: Analyze cluster logs from S3 to identify errors, performance issues, and failures
-4. **Pattern Search**: Search for specific patterns in log files
-5. **Error Diagnosis**: Provide intelligent analysis of Spark errors and suggest solutions
-6. **Timeline Analysis**: Track job execution patterns over time
+3. **Smart Log Analysis**: Advanced iterative analysis that finds errors in minimal iterations
+4. **Quick Error Scanning**: Fast critical error detection for immediate diagnosis
+5. **Pattern Search**: Search for specific patterns in log files with comprehensive regex support
+6. **Error Diagnosis**: Intelligent analysis with 12+ error categories and actionable solutions
+7. **Timeline Analysis**: Track job execution patterns over time
+8. **Focus Area Analysis**: Target specific error types (memory, Spark, I/O, network, etc.)
 
 ## Your Workflow:
 1. **Ask Clarifying Questions**: When a user asks about a job issue, gather:
@@ -86,7 +90,9 @@ def create_databricks_log_agent():
             list_cluster_logs,
             analyze_cluster_logs,
             search_log_pattern,
-            get_job_execution_timeline
+            get_job_execution_timeline,
+            analyze_cluster_logs_smart,
+            quick_error_scan
         ]
     )
 

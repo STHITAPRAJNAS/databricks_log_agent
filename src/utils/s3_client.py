@@ -133,55 +133,277 @@ class S3LogClient:
         except Exception as e:
             return f"Error reading log snippet: {str(e)}"
 
-    async def search_error_patterns(self, cluster_id: str) -> Dict[str, List[str]]:
+    async def search_error_patterns(self, cluster_id: str,
+                                   custom_patterns: Dict[str, List[str]] = None,
+                                   max_errors_per_category: int = 50) -> Dict[str, List[str]]:
+        """
+        Enhanced error pattern search with comprehensive regex patterns.
+        """
         log_files = await self.list_cluster_logs(cluster_id)
-        error_patterns = {
+
+        # Enhanced comprehensive error patterns
+        default_patterns = {
+            'critical_errors': [
+                r'(?i)\bfatal\s+error\b',
+                r'(?i)\bcritical\s+error\b',
+                r'(?i)\boutofmemoryerror\b',
+                r'(?i)\bsegmentation\s+fault\b',
+                r'(?i)\bcore\s+dumped\b',
+                r'(?i)\bpanic\b.*\berror\b',
+                r'(?i)\bcrash\b.*\berror\b'
+            ],
             'spark_errors': [
-                r'Exception', r'Error', r'FAILED', r'java\..*Exception',
-                r'org\.apache\.spark\..*Exception', r'py4j\..*Error'
+                r'(?i)\banalysisexception\b',
+                r'(?i)\bsparkexception\b',
+                r'(?i)org\.apache\.spark\..*exception',
+                r'(?i)\bjob\s+\d+\s+failed\b',
+                r'(?i)\bstage\s+\d+\s+failed\b',
+                r'(?i)\btask\s+failed\b',
+                r'(?i)\bexecutor\s+lost\b',
+                r'(?i)\bdriver\s+stacktrace\b',
+                r'(?i)\bshuffle\s+fetch\s+failed\b'
             ],
-            'job_failures': [
-                r'Job \d+ failed', r'Task failed', r'Stage \d+ failed',
-                r'Application failed', r'Driver stacktrace'
+            'memory_issues': [
+                r'(?i)\boutofmemoryerror\b',
+                r'(?i)java\.lang\.outofmemoryerror',
+                r'(?i)\bcontainer\s+killed.*memory\b',
+                r'(?i)\bgc\s+overhead\s+limit\b',
+                r'(?i)\bheap\s+space\s+exhausted\b',
+                r'(?i)\bmetaspace\s+out\s+of\s+memory\b',
+                r'(?i)\bdirect\s+buffer\s+memory\b'
             ],
-            'resource_issues': [
-                r'OutOfMemoryError', r'Container killed', r'Disk space',
-                r'java\.lang\.OutOfMemoryError', r'No space left on device'
+            'io_errors': [
+                r'(?i)\bfilenotfoundexception\b',
+                r'(?i)\bioexception\b',
+                r'(?i)\bno\s+such\s+file\s+or\s+directory\b',
+                r'(?i)\bpermission\s+denied\b',
+                r'(?i)\baccess\s+denied\b',
+                r'(?i)\bdisk\s+space\s+exhausted\b',
+                r'(?i)\bno\s+space\s+left\s+on\s+device\b',
+                r'(?i)\bread\s+timed\s+out\b'
+            ],
+            'network_errors': [
+                r'(?i)\bconnection\s+refused\b',
+                r'(?i)\bconnection\s+timeout\b',
+                r'(?i)\bconnection\s+reset\b',
+                r'(?i)\bunknownhostexception\b',
+                r'(?i)\bsockettimeoutexception\b',
+                r'(?i)\bnetwork\s+is\s+unreachable\b',
+                r'(?i)\bhost\s+is\s+unreachable\b',
+                r'(?i)\bbroken\s+pipe\b'
+            ],
+            'application_errors': [
+                r'(?i)\bnullpointerexception\b',
+                r'(?i)\bclassnotfoundexception\b',
+                r'(?i)\bclasscastexception\b',
+                r'(?i)\bnumberformatexception\b',
+                r'(?i)\billegalargumentexception\b',
+                r'(?i)\billegalstateexception\b',
+                r'(?i)\bunsupportedoperationexception\b',
+                r'(?i)\bruntimeexception\b'
+            ],
+            'authentication_errors': [
+                r'(?i)\bauthentication\s+failed\b',
+                r'(?i)\bauthorization\s+failed\b',
+                r'(?i)\baccess\s+token\s+expired\b',
+                r'(?i)\binvalid\s+credentials\b',
+                r'(?i)\bunauthorized\s+access\b',
+                r'(?i)\bforbidden\s+access\b',
+                r'(?i)\bssl\s+certificate\s+error\b'
+            ],
+            'configuration_errors': [
+                r'(?i)\bconfiguration\s+error\b',
+                r'(?i)\binvalid\s+configuration\b',
+                r'(?i)\bmissing\s+configuration\b',
+                r'(?i)\bproperty\s+not\s+found\b',
+                r'(?i)\benvironment\s+variable\s+not\s+set\b',
+                r'(?i)\bclasspath\s+error\b',
+                r'(?i)\blibrary\s+not\s+found\b'
             ]
         }
 
+        # Use custom patterns if provided, otherwise use defaults
+        error_patterns = custom_patterns if custom_patterns else default_patterns
         found_errors = {category: [] for category in error_patterns}
 
-        for log_file in log_files:
-            if log_file['log_type'] in ['stderr', 'log4j', 'driver']:
-                try:
-                    content = await self.download_and_read_log(log_file['key'], max_size_mb=20)
+        # Priority order for log files (most likely to contain errors first)
+        priority_order = ['stderr', 'log4j', 'driver', 'executor', 'stdout', 'unknown']
+        sorted_log_files = sorted(log_files,
+                                key=lambda x: priority_order.index(x['log_type'])
+                                if x['log_type'] in priority_order else 99)
 
-                    for category, patterns in error_patterns.items():
-                        for pattern in patterns:
-                            matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
-                            for match in matches:
-                                line_start = content.rfind('\n', 0, match.start()) + 1
-                                line_end = content.find('\n', match.end())
-                                if line_end == -1:
-                                    line_end = len(content)
+        for log_file in sorted_log_files:
+            try:
+                content = await self.download_and_read_log(log_file['key'], max_size_mb=25)
 
-                                error_line = content[line_start:line_end].strip()
-                                found_errors[category].append({
-                                    'file': log_file['file_name'],
-                                    'pattern': pattern,
-                                    'line': error_line,
-                                    'position': match.start()
-                                })
+                # Search for patterns in this file
+                file_errors = await self._search_patterns_in_content(
+                    content, error_patterns, log_file, max_errors_per_category
+                )
 
-                                if len(found_errors[category]) > 20:
-                                    break
+                # Merge results
+                for category, errors in file_errors.items():
+                    found_errors[category].extend(errors)
 
-                        if len(found_errors[category]) > 20:
-                            break
+                    # Trim if exceeded limit
+                    if len(found_errors[category]) > max_errors_per_category:
+                        found_errors[category] = found_errors[category][:max_errors_per_category]
 
-                except Exception as e:
-                    print(f"Error searching in {log_file['key']}: {str(e)}")
-                    continue
+            except Exception as e:
+                print(f"Error searching in {log_file['key']}: {str(e)}")
+                continue
 
         return found_errors
+
+    async def _search_patterns_in_content(self, content: str,
+                                        error_patterns: Dict[str, List[str]],
+                                        log_file: Dict,
+                                        max_per_category: int) -> Dict[str, List[Dict]]:
+        """
+        Search for error patterns within log content with enhanced context extraction.
+        """
+        file_errors = {category: [] for category in error_patterns}
+        lines = content.split('\n')
+
+        for category, patterns in error_patterns.items():
+            for pattern in patterns:
+                try:
+                    matches = list(re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE))
+
+                    for match in matches:
+                        if len(file_errors[category]) >= max_per_category:
+                            break
+
+                        # Find the line containing the match
+                        line_start = content.rfind('\n', 0, match.start()) + 1
+                        line_end = content.find('\n', match.end())
+                        if line_end == -1:
+                            line_end = len(content)
+
+                        error_line = content[line_start:line_end].strip()
+
+                        # Get surrounding context (2 lines before and after)
+                        line_num = content[:match.start()].count('\n')
+                        context_start = max(0, line_num - 2)
+                        context_end = min(len(lines), line_num + 3)
+                        context_lines = lines[context_start:context_end]
+
+                        # Extract timestamp if present
+                        timestamp_match = re.search(
+                            r'\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}',
+                            error_line
+                        )
+                        timestamp = timestamp_match.group() if timestamp_match else None
+
+                        file_errors[category].append({
+                            'file': log_file['file_name'],
+                            'file_type': log_file['log_type'],
+                            'pattern': pattern,
+                            'matched_text': match.group(),
+                            'line': error_line,
+                            'line_number': line_num + 1,
+                            'context': '\n'.join(context_lines),
+                            'timestamp': timestamp,
+                            'position': match.start(),
+                            'severity': self._classify_error_severity(error_line, category)
+                        })
+
+                except re.error as e:
+                    print(f"Invalid regex pattern '{pattern}': {str(e)}")
+                    continue
+
+                if len(file_errors[category]) >= max_per_category:
+                    break
+
+        return file_errors
+
+    def _classify_error_severity(self, error_line: str, category: str) -> str:
+        """
+        Classify error severity based on keywords and category.
+        """
+        error_line_lower = error_line.lower()
+
+        # Critical keywords
+        if any(keyword in error_line_lower for keyword in
+               ['fatal', 'critical', 'panic', 'crash', 'segmentation fault', 'core dumped']):
+            return 'critical'
+
+        # High severity keywords
+        if any(keyword in error_line_lower for keyword in
+               ['outofmemoryerror', 'failed', 'exception', 'severe']):
+            return 'high'
+
+        # Medium severity based on category
+        if category in ['memory_issues', 'critical_errors', 'spark_errors']:
+            return 'high'
+        elif category in ['application_errors', 'io_errors', 'authentication_errors']:
+            return 'medium'
+        else:
+            return 'low'
+
+    async def search_iterative_patterns(self, cluster_id: str,
+                                      max_iterations: int = 3) -> Dict[str, any]:
+        """
+        Iteratively search for error patterns, starting with most critical.
+        """
+        iteration_results = []
+        all_errors = {}
+
+        # Define pattern priority levels
+        pattern_levels = [
+            # Level 1: Critical errors only
+            {
+                'critical_errors': [
+                    r'(?i)\bfatal\s+error\b',
+                    r'(?i)\boutofmemoryerror\b',
+                    r'(?i)\bsegmentation\s+fault\b'
+                ]
+            },
+            # Level 2: Add Spark and memory errors
+            {
+                'spark_errors': [
+                    r'(?i)\banalysisexception\b',
+                    r'(?i)\bjob\s+\d+\s+failed\b',
+                    r'(?i)\btask\s+failed\b'
+                ],
+                'memory_issues': [
+                    r'(?i)\boutofmemoryerror\b',
+                    r'(?i)\bcontainer\s+killed.*memory\b'
+                ]
+            },
+            # Level 3: Comprehensive search
+            {}
+        ]
+
+        for iteration in range(min(max_iterations, len(pattern_levels))):
+            patterns = pattern_levels[iteration] if iteration < len(pattern_levels) else None
+
+            results = await self.search_error_patterns(
+                cluster_id,
+                custom_patterns=patterns,
+                max_errors_per_category=20 if iteration == 0 else 50
+            )
+
+            iteration_results.append({
+                'iteration': iteration + 1,
+                'patterns_used': list(patterns.keys()) if patterns else 'comprehensive',
+                'errors_found': sum(len(errors) for errors in results.values()),
+                'categories': list(results.keys())
+            })
+
+            # Merge results
+            for category, errors in results.items():
+                if category not in all_errors:
+                    all_errors[category] = []
+                all_errors[category].extend(errors)
+
+            # Early termination if critical errors found
+            if iteration == 0 and results.get('critical_errors'):
+                break
+
+        return {
+            'errors_by_category': all_errors,
+            'iteration_summary': iteration_results,
+            'total_errors': sum(len(errors) for errors in all_errors.values()),
+            'categories_found': list(all_errors.keys())
+        }

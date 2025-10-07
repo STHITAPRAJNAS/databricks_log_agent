@@ -191,6 +191,7 @@ async def analyze_cluster_logs(cluster_id: str,
             "cluster_id": cluster_id,
             "files_analyzed": files_processed,
             "search_pattern": search_pattern,
+            "analysis_method": "iterative" if use_iterative else "standard",
             "analysis": analysis
         }
 
@@ -317,3 +318,158 @@ async def get_job_execution_timeline(job_name_pattern: str,
 
     except Exception as e:
         return f"Error getting job timeline: {str(e)}"
+
+async def analyze_cluster_logs_smart(cluster_id: str,
+                                   focus_areas: Optional[List[str]] = None) -> str:
+    """
+    Smart analysis that iteratively searches for errors with minimal iterations.
+
+    Args:
+        cluster_id: The cluster ID to analyze logs for
+        focus_areas: List of error categories to focus on (e.g., ['memory', 'spark', 'io'])
+
+    Returns:
+        Optimized analysis results focusing on critical errors
+    """
+    try:
+        s3_client = S3LogClient()
+
+        # Use iterative pattern search for fast error discovery
+        pattern_results = await s3_client.search_iterative_patterns(cluster_id, max_iterations=3)
+
+        if not pattern_results['errors_by_category']:
+            return f"No errors found in logs for cluster: {cluster_id}"
+
+        # Focus on specific areas if requested
+        if focus_areas:
+            filtered_errors = {}
+            area_mapping = {
+                'memory': ['memory_issues', 'critical_errors'],
+                'spark': ['spark_errors'],
+                'io': ['io_errors'],
+                'network': ['network_errors'],
+                'auth': ['authentication_errors'],
+                'config': ['configuration_errors'],
+                'app': ['application_errors']
+            }
+
+            for area in focus_areas:
+                categories = area_mapping.get(area, [area])
+                for category in categories:
+                    if category in pattern_results['errors_by_category']:
+                        filtered_errors[category] = pattern_results['errors_by_category'][category]
+
+            pattern_results['errors_by_category'] = filtered_errors
+
+        # Format results for better readability
+        summary = {
+            "cluster_id": cluster_id,
+            "analysis_method": "smart_iterative",
+            "total_iterations": len(pattern_results['iteration_summary']),
+            "focus_areas": focus_areas or "all",
+            "critical_findings": [],
+            "error_breakdown": pattern_results['errors_by_category'],
+            "iteration_details": pattern_results['iteration_summary'],
+            "recommendations": []
+        }
+
+        # Extract critical findings
+        for category, errors in pattern_results['errors_by_category'].items():
+            critical_errors = [e for e in errors if e.get('severity') == 'critical']
+            high_errors = [e for e in errors if e.get('severity') == 'high']
+
+            if critical_errors:
+                summary['critical_findings'].append({
+                    "category": category,
+                    "severity": "critical",
+                    "count": len(critical_errors),
+                    "examples": critical_errors[:3]
+                })
+            elif high_errors:
+                summary['critical_findings'].append({
+                    "category": category,
+                    "severity": "high",
+                    "count": len(high_errors),
+                    "examples": high_errors[:2]
+                })
+
+        # Add recommendations based on error patterns
+        if 'memory_issues' in pattern_results['errors_by_category']:
+            summary['recommendations'].append(
+                "🔧 Memory optimization needed: Consider increasing executor memory or optimizing data partitioning"
+            )
+
+        if 'spark_errors' in pattern_results['errors_by_category']:
+            summary['recommendations'].append(
+                "⚡ Spark configuration review: Check job parameters and cluster settings"
+            )
+
+        if 'io_errors' in pattern_results['errors_by_category']:
+            summary['recommendations'].append(
+                "📁 I/O troubleshooting: Verify file paths, permissions, and storage connectivity"
+            )
+
+        return json.dumps(summary, indent=2, default=str)
+
+    except Exception as e:
+        return f"Error in smart log analysis: {str(e)}"
+
+async def quick_error_scan(cluster_id: str) -> str:
+    """
+    Quick scan for critical errors only - optimized for minimal analysis time.
+
+    Args:
+        cluster_id: The cluster ID to scan
+
+    Returns:
+        Quick summary of critical errors found
+    """
+    try:
+        s3_client = S3LogClient()
+
+        # Single iteration focusing only on critical patterns
+        critical_patterns = {
+            'critical_errors': [
+                r'(?i)\bfatal\s+error\b',
+                r'(?i)\boutofmemoryerror\b',
+                r'(?i)\bjob\s+\d+\s+failed\b',
+                r'(?i)\banalysisexception\b'
+            ]
+        }
+
+        errors = await s3_client.search_error_patterns(
+            cluster_id,
+            custom_patterns=critical_patterns,
+            max_errors_per_category=10
+        )
+
+        if not errors or not errors.get('critical_errors'):
+            return f"✅ No critical errors found in cluster: {cluster_id}"
+
+        critical_count = len(errors['critical_errors'])
+
+        # Extract key error details
+        error_types = set()
+        for error in errors['critical_errors'][:5]:
+            if 'outofmemory' in error['line'].lower():
+                error_types.add('Memory Issues')
+            elif 'job' in error['line'].lower() and 'failed' in error['line'].lower():
+                error_types.add('Job Failures')
+            elif 'analysisexception' in error['line'].lower():
+                error_types.add('SQL Errors')
+            else:
+                error_types.add('Critical Errors')
+
+        result = {
+            "cluster_id": cluster_id,
+            "scan_type": "quick_critical_scan",
+            "critical_errors_found": critical_count,
+            "error_types": list(error_types),
+            "sample_errors": errors['critical_errors'][:3],
+            "recommendation": "Run full analysis for detailed diagnosis" if critical_count > 0 else "No immediate action needed"
+        }
+
+        return json.dumps(result, indent=2, default=str)
+
+    except Exception as e:
+        return f"Error in quick error scan: {str(e)}"
